@@ -1,0 +1,5 @@
+BasedOnStyle: WebKit
+IndentWidth: 4
+AllowShortIfStatementsOnASingleLine: true
+ReflowComments: false
+AlignTrailingComments: false
