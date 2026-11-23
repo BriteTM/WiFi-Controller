@@ -1,2 +1,7 @@
-.pio
+.pio/
 compile_commands.json
+.ccls
+.clangd
+.vscode/
+build/
+sdkconfig*

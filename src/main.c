@@ -1,45 +1,70 @@
+#include "driver/gpio_etm.h"
 #include "driver/gptimer.h"
 #include "driver/gptimer_types.h"
 #include "driver/i2c_master.h"
 #include "driver/i2c_types.h"
 #include "esp_event.h"
+#include "esp_event_base.h"
 #include "esp_mac.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_wifi_types_generic.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/FreeRTOSConfig_arch.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
 #include "freertos/task.h"
+#include "hal/gpio_types.h"
+#include "driver/gpio.h"
 #include "hal/i2c_types.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "portmacro.h"
 #include "soc/clk_tree_defs.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <characters.h>
+#include "esp_wifi.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
+
+#define BUTTON_GPIO 5
+#define WIFI_SSID ESP32
+#define WIFI_PASS Ae-12-ph
+#define WIFI_CHANNEL 
+#define MAX_STA_CONN
 
 static const char* TAG = "Shiny";
+
+static uint16_t Encounters = 0;
 
 // Global handles for all functions
 i2c_master_bus_handle_t masterhandle;
 i2c_master_dev_handle_t Oleddev;
 gptimer_handle_t shclock = NULL;
 TaskHandle_t oled_task_handle = NULL;
+QueueHandle_t ButtonQ = NULL;
 
-static uint8_t display_buffer[257] = {0};
+static uint8_t display_buffer[257] = { 0 };
 
 // function prototypes
-void save_shiny_count(uint32_t Encounters);
-void load_shiny_count(uint32_t* Encounters);
+void save_shiny_count(uint16_t Encounters);
+void load_shiny_count(uint16_t* Encounters);
 static void init_i2c(void);
 static void init_nvs(void);
 static void init_timer(void);
 static void init_display(void);
-
-static void Test_Display(void *pvParameters);
+static void Update_Counter(void* pvParameters);
+static void Test_Display(void* pvParameters);
+static void PIN5_ISR_HANDLER(void* arg);
+static void init_button(void);
+static void oled_display_task(void* pvParameters);
+static void wifi_init_softap(void);
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 
 // Timer Callback
 static bool example_timer_on_alarm_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t* edata, void* user_ctx)
@@ -59,120 +84,149 @@ void app_main(void)
 {
     init_nvs();
     init_i2c();
-
-
     init_timer();
-	init_display();
+    init_display();
+    init_button();
 
-	// Tasks
-	xTaskCreate(Test_Display, "Test Display", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    ButtonQ = xQueueCreate(10, sizeof(uint32_t));
+
+    load_shiny_count((uint16_t*)&Encounters);
+
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BUTTON_GPIO, PIN5_ISR_HANDLER, (void*)BUTTON_GPIO);
+
+    // Tasks
+    //xTaskCreate(Test_Display, "Test Display", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    xTaskCreate(Update_Counter, "ShinyHuntingCount", 2048, NULL, 5, NULL);
+    xTaskCreate(oled_display_task, "UpdateOled", 4096, NULL, 0x02, &oled_task_handle);
+
+    vTaskDelete(NULL);
 }
 
-static void Test_Display(void *pvParameters){
-	while(1){
-		// Load the hex values for 4 into the display buffer, leaving room for the 0x40 pixel write command
-		// at index 0
-		for(int i = 0; i < 5; i++){
-			display_buffer[i + 11] = disp4[(i)];
-		}
-		// Prepend the pixel command to display_buffer, and then send it over i2c
-		display_buffer[0] = 0x40;
-		ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, display_buffer, sizeof(display_buffer), -1));
-		vTaskDelay(pdMS_TO_TICKS(50));
+
+static void wifi_config(void *pvParameters){
+	wifi_interface_t APinterface = WIFI_PROTOCOL_11N;
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	const wifi_init_config_t initconfig = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_ERROR_CHECK(esp_wifi_init(&initconfig));
+
+	esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+
+	// Create a config 
+	wifi_config_t APconf = {
+		.ap = {
+			.ssid = "ShinyHuntAP",
+			.ssid_len = 0,
+			.password = "Ae-12-ph", 
+			.channel = 1,
+			.max_connection = 4,
+			.authmode = WIFI_AUTH_WPA2_PSK
+		},
+	};
+	ESP_ERROR_CHECK(esp_wifi_init(&initconfig));
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP)); // Configure as Access Point Mode
+	ESP_ERROR_CHECK(esp_wifi_set_config(APinterface, &APconf));
+	ESP_ERROR_CHECK(esp_wifi_start());
+
+	ESP_LOGI(TAG, "wifi started up");
+}
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data){
+	switch (event_id) {
+		case WIFI_EVENT_AP_START:
+			// Do something here?
+		case WIFI_EVENT_AP_STOP:
+			// DO something else here??
 	}
-	// If task ever breaks out of loop, delete it
-	vTaskDelete(NULL);
 }
 
-static void init_display(void){
 
-	// Multiplex Ration:
-	// 0x00 = command mode
-	// 0xA8 = set multiplex ratio 
-	// 0x1F = 31 rows
-	uint8_t mux_val[] = { 0x00, 0xA8, 0x1F };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, mux_val, sizeof(mux_val), -1));
+static void init_display(void)
+{
+    // Multiplex Ration:
+    // 0x00 = command mode
+    // 0xA8 = set multiplex ratio
+    // 0x1F = 31 rows
+    uint8_t mux_val[] = { 0x00, 0xA8, 0x1F };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, mux_val, sizeof(mux_val), -1));
 
-	// Com Mode Setup:
-	// 0x00 = command
-	// 0xDA = Com Pings Hardware Configuration Command
-	// 0x02 = Sequential mode for our 64x32 screen
-	uint8_t com_pin_command[] = { 0x00, 0xDA, 0x02 };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, com_pin_command, sizeof(com_pin_command), -1));
+    // Com Mode Setup:
+    // 0x00 = command
+    // 0xDA = Com Pings Hardware Configuration Command
+    // 0x02 = Sequential mode for our 64x32 screen
+    uint8_t com_pin_command[] = { 0x00, 0xDA, 0x02 };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, com_pin_command, sizeof(com_pin_command), -1));
 
-	// Memory Mode:
-	// 0x00 = command
-	// 0x20 = Memory Addressing Mode, page 34
-	// 0x00 = Horizontal addressing mode, automatically go down once end of column is reached
-	uint8_t mem_mode[] = { 0x00, 0x20, 0x00 };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, mem_mode, sizeof(mem_mode), -1));
+    // Memory Mode:
+    // 0x00 = command
+    // 0x20 = Memory Addressing Mode, page 34
+    // 0x00 = Horizontal addressing mode, automatically go down once end of column is reached
+    uint8_t mem_mode[] = { 0x00, 0x20, 0x00 };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, mem_mode, sizeof(mem_mode), -1));
 
-	// Column Limits:
-	// 0x00 = command
-	// 0x21 = Set Column Address, page 34. It specifies the start and end mem address in RAM
-	// 0x00 = 0
-	// 0x3F = 63
-	uint8_t column_addr[] = { 0x00, 0x21, 0x20, 0x5F };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, column_addr, sizeof(column_addr), -1));
+    // Column Limits:
+    // 0x00 = command
+    // 0x21 = Set Column Address, page 34. It specifies the start and end mem address in RAM
+    // 0x00 = 0
+    // 0x3F = 63
+    uint8_t column_addr[] = { 0x00, 0x21, 0x20, 0x5F };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, column_addr, sizeof(column_addr), -1));
 
-	// Page Address Limits:
-	// 0x00 = command
-	// 0x22 = Set page address, page 35. It specifies the start and end pages.
-	// 0x00 = 0
-	// 0x03 = 3 
-	uint8_t pages_addr[] = { 0x00, 0x22, 0x00, 0x03 };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, pages_addr, sizeof(pages_addr), -1));
+    // Page Address Limits:
+    // 0x00 = command
+    // 0x22 = Set page address, page 35. It specifies the start and end pages.
+    // 0x00 = 0
+    // 0x03 = 3
+    uint8_t pages_addr[] = { 0x00, 0x22, 0x00, 0x03 };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, pages_addr, sizeof(pages_addr), -1));
 
-	// Power on:
-	// Continuation bit 0, Data/Command selection bit 0, + 6 more zeros (0x00)
-	// 0xAF is the value to turn on the OLED
-	uint8_t write_buf[2] = { 0x00, 0xAF };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, write_buf, sizeof(write_buf), -1));
+    // Power on:
+    // Continuation bit 0, Data/Command selection bit 0, + 6 more zeros (0x00)
+    // 0xAF is the value to turn on the OLED
+    uint8_t write_buf[2] = { 0x00, 0xAF };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, write_buf, sizeof(write_buf), -1));
 
-	// Charge Pump:
-	// 0x00 = command
-	// 0x8D = Charge pump setting
-	// 0x14 = Enable Charge Pump
-	uint8_t charge_pump[] = { 0x00, 0x8D, 0x14 };
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, charge_pump, sizeof(charge_pump), -1));
-	
-	// This block clears the screen, since display_buffer is initialized with all zeros
-	// Prepend the code 0x40 to the display buffer, which says that "I'm sending raw pixel data"
-	display_buffer[0] = 0x40;
-	ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, display_buffer, sizeof(display_buffer), -1));
+    // Charge Pump:
+    // 0x00 = command
+    // 0x8D = Charge pump setting
+    // 0x14 = Enable Charge Pump
+    uint8_t charge_pump[] = { 0x00, 0x8D, 0x14 };
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, charge_pump, sizeof(charge_pump), -1));
+
+    // This block clears the screen, since display_buffer is initialized with all zeros
+    // Prepend the code 0x40 to the display buffer, which says that "I'm sending raw pixel data"
+    display_buffer[0] = 0x40;
+    ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, display_buffer, sizeof(display_buffer), -1));
 }
 
-void save_shiny_count(uint32_t Encounters)
+void save_shiny_count(uint16_t Encounters)
 {
     nvs_handle_t my_handle;
     esp_err_t err = nvs_open("storage", NVS_READWRITE, &my_handle);
     if (err == ESP_OK) {
-
         // Set key-pair "Encounters" with value Encounters, inside
         // namespace storage
-        nvs_set_u32(my_handle, "Encounters", Encounters);
+        nvs_set_u16(my_handle, "Encounters", Encounters);
         // Commit the changes to my_handle
         nvs_commit(my_handle);
-
         // Close the handle to free up memory
         nvs_close(my_handle);
     }
 }
 
-void load_shiny_count(uint32_t* Encounters)
+void load_shiny_count(uint16_t* Encounters)
 {
     nvs_handle_t my_handle;
     esp_err_t err = nvs_open("storage", NVS_READONLY, &my_handle);
     if (err == ESP_OK) {
         // get the unsigned 32-bit int from Encounters inside our handle, which is tied to namespace storage
-        nvs_get_u32(my_handle, "Encounters", Encounters);
+        nvs_get_u16(my_handle, "Encounters", Encounters);
         nvs_close(my_handle);
     }
 }
 
 static void init_i2c(void)
 {
-
     // i2c setup
     i2c_master_bus_config_t i2c_mst_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -181,7 +235,7 @@ static void init_i2c(void)
         .sda_io_num = 9,
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
-		.flags.enable_internal_pullup = true,
+        .flags.enable_internal_pullup = true,
     };
 
     i2c_device_config_t Oled = {
@@ -190,6 +244,7 @@ static void init_i2c(void)
         .scl_speed_hz = 400000,
         .scl_wait_us = 0,
     };
+
     // I2C Setup Section
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &masterhandle)); // assign mstconfig to masterhandle
     ESP_ERROR_CHECK(i2c_master_bus_add_device(masterhandle, &Oled, &Oleddev));
@@ -197,7 +252,6 @@ static void init_i2c(void)
 
 static void init_timer(void)
 {
-
     // gptimer setup
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
@@ -237,7 +291,6 @@ static void init_timer(void)
 
 static void init_nvs(void)
 {
-
     // initialize non-volatile flash, and this function returns a value of
     // esp_err_t, which allows us to error check below
     esp_err_t err = nvs_flash_init();
@@ -248,12 +301,99 @@ static void init_nvs(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
+
     ESP_ERROR_CHECK(err);
 }
 
-static void oled_display_task(void* pvParameters){
-	while(1){
-		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-		ESP_LOGI(TAG, "OLED updated with new count1");
-	}
+static void oled_display_task(void* pvParameters)
+{
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        memset(display_buffer, 0x00, sizeof(display_buffer));
+
+        int buf_index = 1;
+
+        // Draw command
+        display_buffer[0] = 0x40;
+
+        char string[6];
+
+        snprintf(string, sizeof(string), "%u", Encounters);
+
+        for (int i = 0; string[i] != '\0'; i++) {
+            for (int j = 0; j < 5; j++) {
+                display_buffer[buf_index] = font_ascii[(string[i] - 32)][j];
+                buf_index++;
+            }
+
+            display_buffer[buf_index] = 0x00;
+            buf_index++;
+        }
+
+        ESP_ERROR_CHECK(i2c_master_transmit(Oleddev, display_buffer, sizeof(display_buffer), -1));
+    }
+}
+
+static void init_button(void)
+{
+    gpio_config_t gpio5_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+
+    gpio_config(&gpio5_conf);
+}
+
+static void IRAM_ATTR PIN5_ISR_HANDLER(void* arg)
+{
+    // static means that it won't be deleted between ISR calls, and we use
+    // xTaskGetTickCountFromISR to get the ticks, and then subtract them from the
+    // previous tick count, to see how long its been between ISR's
+    static TickType_t last_isr_time = 0;
+    TickType_t current_time = xTaskGetTickCountFromISR();
+
+    if ((current_time - last_isr_time) > pdMS_TO_TICKS(250)) {
+        // Cast the arg back to uint32_t. We specifically pass 5 to this function, and then pass that to
+        // the queue, so that we can indicate that we are acknowledging an interrupt from gpio 5.
+        uint32_t gpio_num = (uint32_t)arg;
+
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+        xQueueSendToFrontFromISR(ButtonQ, &gpio_num, &xHigherPriorityTaskWoken);
+
+        if (xHigherPriorityTaskWoken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+
+    } else {
+    }
+
+    last_isr_time = current_time;
+}
+
+static void Update_Counter(void* pvParameters)
+{
+    while (1) {
+        // Create a buffer to store the value pulled from the queue,
+        // pass the address so the variable can be modified, and wait infinitely for the next queue update.
+        uint32_t buffer = 0;
+
+        xQueueReceive(ButtonQ, &buffer, portMAX_DELAY);
+
+        Encounters++;
+
+        save_shiny_count(Encounters);
+		ESP_LOGI("SHINY", "Count is now; %u", Encounters);
+
+        // Notify the OLED task to wake up and redraw the updated count
+        if (oled_task_handle != NULL) {
+            xTaskNotifyGive(oled_task_handle);
+        }
+    }
+
+    vTaskDelete(NULL);
 }
